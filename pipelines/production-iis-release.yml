@@ -1,0 +1,215 @@
+# ==========================================================================
+# Production release pipeline for IIS-hosted .NET apps (on-prem ADO Server)
+#
+#   Dry-run health check  ->  Build & package  ->  Deploy (PR / DR / Both)
+#                                                   └─ auto-rollback on failure
+#   OR (performRollback = true)  ->  Manual rollback to a chosen backup
+#
+# Lives in a central pipelines repo; the application code is checked out
+# from its own repo via `resources.repositories`.
+# ==========================================================================
+trigger: none
+
+parameters:
+  - name: selectedProject
+    displayName: 'Project to deploy / roll back'
+    type: string
+    default: 'PortalApp.Web'
+    values:
+      - 'PortalApp.Web'
+      - 'PortalApp.CronJob'
+
+  - name: deployTarget
+    displayName: 'Target production site'
+    type: string
+    default: 'PR'
+    values:
+      - 'PR'
+      - 'DR'
+      - 'Both'
+
+  - name: performRollback
+    displayName: 'Perform ROLLBACK ONLY (skips health check, build and deploy)'
+    type: boolean
+    default: false
+
+  - name: backupToRestore
+    displayName: 'Backup to restore ("latest" or exact file name, e.g. PreDeploy_Backup_20260924_164012.zip)'
+    type: string
+    default: 'latest'
+
+resources:
+  repositories:
+    - repository: AppRepo
+      type: git
+      name: <PROJECT>/<APP_REPO>
+      ref: refs/heads/master
+
+variables:
+  - group: <PROD_VARIABLE_GROUP>
+  - name: buildConfiguration
+    value: Release
+  - name: artifactName
+    value: drop
+  - name: backupsToKeep
+    value: 5
+
+  # ---- Per-project mapping. PR and DR differ in paths, app pools and backup locations ----
+  - ${{ if eq(parameters.selectedProject, 'PortalApp.Web') }}:
+    - name: projectPath
+      value: 'PortalApp/PortalApp.Web/PortalApp.Web.csproj'
+    - name: dotNetVersion
+      value: '6.0.x'
+    - name: prPath
+      value: 'E:\WebServer\Applications\PortalApp.Web'
+    - name: prAppPool
+      value: 'PortalApp.Web'
+    - name: prBackupDir
+      value: 'F:\DeployBackups\PortalApp.Web'
+    - name: drPath
+      value: 'E:\WebServer\Applications\PortalApp.Web'
+    - name: drAppPool
+      value: 'PortalApp.Web'
+    - name: drBackupDir
+      value: 'F:\DeployBackups\PortalApp.Web'
+
+  - ${{ if eq(parameters.selectedProject, 'PortalApp.CronJob') }}:
+    - name: projectPath
+      value: 'PortalApp/PortalApp.CronJob/PortalApp.CronJob.csproj'
+    - name: dotNetVersion
+      value: '6.0.x'
+    - name: prPath
+      value: 'E:\CronJobs\PortalApp.CronJob'
+    - name: prAppPool
+      value: 'PortalApp.CronJob'
+    - name: prBackupDir
+      value: 'F:\DeployBackups\PortalApp.CronJob'
+    - name: drPath
+      value: 'E:\CronJobs\PortalApp.CronJob'
+    - name: drAppPool
+      value: 'PortalApp.CronJob'
+    - name: drBackupDir
+      value: 'F:\DeployBackups\PortalApp.CronJob'
+
+stages:
+
+# ======================= NORMAL RELEASE =======================
+- ${{ if eq(parameters.performRollback, false) }}:
+
+  # ---- Stage 0: dry-run health checks (run in parallel with the build) ----
+  - ${{ if ne(parameters.deployTarget, 'DR') }}:
+    - template: templates/health-check-stage.yml
+      parameters:
+        siteName: PR
+        poolName: 'Production-PR Pool'
+        productionPath: '$(prPath)'
+        backupDir: '$(prBackupDir)'
+        appPoolName: '$(prAppPool)'
+
+  - ${{ if ne(parameters.deployTarget, 'PR') }}:
+    - template: templates/health-check-stage.yml
+      parameters:
+        siteName: DR
+        poolName: 'Production-DR Pool'
+        productionPath: '$(drPath)'
+        backupDir: '$(drBackupDir)'
+        appPoolName: '$(drAppPool)'
+
+  # ---- Stage 1: build once, deploy the same artifact everywhere ----
+  - stage: Build
+    displayName: 'Build and package ${{ parameters.selectedProject }}'
+    dependsOn: []
+    pool:
+      name: Default
+    jobs:
+    - job: BuildJob
+      displayName: 'Compile and create artifact'
+      workspace:
+        clean: all
+      steps:
+      - checkout: self
+        clean: true
+      - checkout: AppRepo
+        clean: true
+
+      - task: UseDotNet@2
+        displayName: 'Use .NET SDK $(dotNetVersion)'
+        inputs:
+          packageType: sdk
+          version: '$(dotNetVersion)'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet publish'
+        inputs:
+          command: publish
+          publishWebProjects: false
+          projects: '$(projectPath)'
+          arguments: '--configuration $(buildConfiguration) --output "$(Pipeline.Workspace)\publish"'
+          zipAfterPublish: false
+
+      - powershell: |
+          $publishDir = "$(Pipeline.Workspace)\publish"
+          $zip = "$(Build.ArtifactStagingDirectory)\publish.zip"
+
+          # Environment config stays on the server: never ship appsettings*.json or web.config
+          Get-ChildItem $publishDir -Recurse -Include "appsettings*.json","web.config" |
+              ForEach-Object { Write-Host "Removing $($_.FullName)"; Remove-Item $_.FullName -Force }
+
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($publishDir, $zip)
+        displayName: 'Strip environment config and zip'
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish artifact'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)\publish.zip'
+          ArtifactName: '$(artifactName)'
+
+  # ---- Stage 2: deploy (each site waits for its own health check + the build) ----
+  - ${{ if ne(parameters.deployTarget, 'DR') }}:
+    - template: templates/deploy-iis-stage.yml
+      parameters:
+        siteName: PR
+        poolName: 'Production-PR Pool'
+        environmentName: 'Production-PR'
+        productionPath: '$(prPath)'
+        appPoolName: '$(prAppPool)'
+        backupDir: '$(prBackupDir)'
+        backupsToKeep: 5
+
+  - ${{ if ne(parameters.deployTarget, 'PR') }}:
+    - template: templates/deploy-iis-stage.yml
+      parameters:
+        siteName: DR
+        poolName: 'Production-DR Pool'
+        environmentName: 'Production-DR'
+        productionPath: '$(drPath)'
+        appPoolName: '$(drAppPool)'
+        backupDir: '$(drBackupDir)'
+        backupsToKeep: 5
+
+# ======================= ROLLBACK ONLY =======================
+- ${{ if eq(parameters.performRollback, true) }}:
+
+  - ${{ if ne(parameters.deployTarget, 'DR') }}:
+    - template: templates/rollback-iis-stage.yml
+      parameters:
+        siteName: PR
+        poolName: 'Production-PR Pool'
+        environmentName: 'Production-PR'
+        productionPath: '$(prPath)'
+        appPoolName: '$(prAppPool)'
+        backupDir: '$(prBackupDir)'
+        backupToRestore: '${{ parameters.backupToRestore }}'
+
+  - ${{ if ne(parameters.deployTarget, 'PR') }}:
+    - template: templates/rollback-iis-stage.yml
+      parameters:
+        siteName: DR
+        poolName: 'Production-DR Pool'
+        environmentName: 'Production-DR'
+        productionPath: '$(drPath)'
+        appPoolName: '$(drAppPool)'
+        backupDir: '$(drBackupDir)'
+        backupToRestore: '${{ parameters.backupToRestore }}'

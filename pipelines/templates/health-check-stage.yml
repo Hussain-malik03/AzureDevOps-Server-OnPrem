@@ -1,0 +1,85 @@
+# ==========================================================
+# STAGE TEMPLATE: Dry Run — production server health check
+# Aborts the release BEFORE anything on the server is touched.
+# ==========================================================
+parameters:
+  - name: siteName        # PR | DR
+    type: string
+  - name: poolName
+    type: string
+  - name: productionPath
+    type: string
+  - name: backupDir
+    type: string
+  - name: appPoolName
+    type: string
+  - name: minFreeDiskPct
+    type: number
+    default: 5
+  - name: maxCpuPct
+    type: number
+    default: 90
+  - name: maxMemPct
+    type: number
+    default: 90
+
+stages:
+- stage: HealthCheck_${{ parameters.siteName }}
+  displayName: 'Dry Run: ${{ parameters.siteName }} server health check'
+  dependsOn: []
+  pool:
+    name: ${{ parameters.poolName }}
+  jobs:
+  - job: HealthCheck
+    displayName: 'Verify Disk / CPU / Memory / App Pool'
+    workspace:
+      clean: all
+    steps:
+    - checkout: none
+
+    - powershell: |
+        $ErrorActionPreference = "Stop"
+        $failures = @()
+
+        # --- 1. DISK: free space on the app drive AND the backup drive ---
+        $drives = @(
+            (Split-Path -Qualifier "${{ parameters.productionPath }}").TrimEnd(':'),
+            (Split-Path -Qualifier "${{ parameters.backupDir }}").TrimEnd(':')
+        ) | Select-Object -Unique
+
+        foreach ($driveLetter in $drives) {
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$driveLetter`:'"
+            if ($null -eq $disk) { $failures += "Could not read disk info for drive $driveLetter`:"; continue }
+            $freePct = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 2)
+            Write-Host "Drive $driveLetter`: free = $freePct% (need >= ${{ parameters.minFreeDiskPct }}%)"
+            if ($freePct -lt ${{ parameters.minFreeDiskPct }}) { $failures += "Low disk on $driveLetter`: $freePct% free" }
+        }
+
+        # --- 2. CPU: average of 3 samples ---
+        $cpu = (Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 2 -MaxSamples 3).CounterSamples
+        $avgCpu = [math]::Round(($cpu | Measure-Object -Property CookedValue -Average).Average, 2)
+        Write-Host "Average CPU = $avgCpu% (max ${{ parameters.maxCpuPct }}%)"
+        if ($avgCpu -gt ${{ parameters.maxCpuPct }}) { $failures += "CPU too high: $avgCpu%" }
+
+        # --- 3. MEMORY ---
+        $os = Get-CimInstance Win32_OperatingSystem
+        $usedMem = [math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100, 2)
+        Write-Host "Memory used = $usedMem% (max ${{ parameters.maxMemPct }}%)"
+        if ($usedMem -gt ${{ parameters.maxMemPct }}) { $failures += "Memory too high: $usedMem%" }
+
+        # --- 4. APP POOL: must exist and be readable (catches IIS permission issues early) ---
+        try {
+            Import-Module WebAdministration
+            $state = (Get-WebAppPoolState -Name "${{ parameters.appPoolName }}").Value
+            Write-Host "App Pool '${{ parameters.appPoolName }}' = $state"
+        } catch {
+            $failures += "Cannot read App Pool '${{ parameters.appPoolName }}': $($_.Exception.Message)"
+        }
+
+        if ($failures.Count -gt 0) {
+            Write-Host "=== DRY RUN FAILED ==="
+            $failures | ForEach-Object { Write-Host " - $_" }
+            throw "Health check failed on ${{ parameters.siteName }}. Deployment aborted before touching production."
+        }
+        Write-Host "=== DRY RUN PASSED: ${{ parameters.siteName }} is healthy ==="
+      displayName: 'Check Disk / CPU / Memory / App Pool'

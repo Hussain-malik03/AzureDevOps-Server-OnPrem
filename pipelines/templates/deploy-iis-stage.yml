@@ -1,0 +1,131 @@
+# ==========================================================
+# STAGE TEMPLATE: Deploy to an IIS site with automatic rollback
+# Stop app pool -> backup -> sync -> start. Any failure after
+# files are touched restores the pre-deploy backup.
+# ==========================================================
+parameters:
+  - name: siteName
+    type: string
+  - name: poolName
+    type: string
+  - name: productionPath
+    type: string
+  - name: appPoolName
+    type: string
+  - name: backupDir
+    type: string
+  - name: backupsToKeep
+    type: number
+    default: 5
+  - name: artifactName
+    type: string
+    default: drop
+  - name: environmentName     # Azure DevOps Environment (approvals/checks live here)
+    type: string
+
+stages:
+- stage: Deploy_${{ parameters.siteName }}
+  displayName: 'Deploy to ${{ parameters.siteName }}'
+  dependsOn:
+    - Build
+    - HealthCheck_${{ parameters.siteName }}
+  jobs:
+  - deployment: DeployIIS
+    displayName: 'Stop, Backup, Sync, Start (${{ parameters.siteName }})'
+    environment: ${{ parameters.environmentName }}
+    pool:
+      name: ${{ parameters.poolName }}
+    workspace:
+      clean: all
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none        # artifact is fetched explicitly below
+          - checkout: none
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download build artifact'
+            inputs:
+              buildType: current
+              downloadType: single
+              artifactName: '${{ parameters.artifactName }}'
+              downloadPath: '$(Pipeline.Workspace)'
+
+          - powershell: |
+              $ErrorActionPreference = "Stop"
+              $destPath   = "${{ parameters.productionPath }}"
+              $appPool    = "${{ parameters.appPoolName }}"
+              $backupDir  = "${{ parameters.backupDir }}"
+              $keep       = ${{ parameters.backupsToKeep }}
+              $zip        = "$(Pipeline.Workspace)\${{ parameters.artifactName }}\publish.zip"
+              $tmpExtract = "$(Agent.TempDirectory)\publish_extract"
+
+              Import-Module WebAdministration
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              foreach ($d in @($destPath, $backupDir)) {
+                  if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+              }
+
+              # --- 1. STOP APP POOL (poll until actually stopped) ---
+              if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") {
+                  Stop-WebAppPool -Name $appPool
+                  $timeout = 90; $elapsed = 0
+                  while ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped" -and $elapsed -lt $timeout) {
+                      Start-Sleep -Seconds 1; $elapsed++
+                  }
+                  $state = (Get-WebAppPoolState -Name $appPool).Value
+                  if ($state -ne "Stopped") {
+                      throw "App Pool '$appPool' did not stop within $timeout s (state: $state). No files changed."
+                  }
+              }
+
+              $backupFile = $null
+              $filesTouched = $false
+              try {
+                  # --- 2. PRE-DEPLOY BACKUP (after stop, so nothing is locked) ---
+                  if ((Get-ChildItem $destPath -Force | Measure-Object).Count -gt 0) {
+                      $backupFile = Join-Path $backupDir ("PreDeploy_Backup_{0}.zip" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+                      Write-Host "Backing up current release -> $backupFile"
+                      [System.IO.Compression.ZipFile]::CreateFromDirectory($destPath, $backupFile)
+
+                      # Retention: keep newest N backups
+                      Get-ChildItem $backupDir -Filter "PreDeploy_Backup_*.zip" |
+                          Sort-Object LastWriteTime -Descending | Select-Object -Skip $keep |
+                          ForEach-Object { Write-Host "Pruning $($_.Name)"; Remove-Item $_.FullName -Force }
+                  }
+
+                  # --- 3. EXTRACT ---
+                  if (Test-Path $tmpExtract) { Remove-Item $tmpExtract -Recurse -Force }
+                  [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $tmpExtract)
+                  $source = $tmpExtract
+                  $dirs = Get-ChildItem $tmpExtract -Directory -Force
+                  $files = Get-ChildItem $tmpExtract -File -Force
+                  if ($files.Count -eq 0 -and $dirs.Count -eq 1) { $source = $dirs[0].FullName }
+
+                  # --- 4. SYNC (appsettings/web.config were stripped at build, so server config is preserved) ---
+                  $filesTouched = $true
+                  & robocopy "$source" "$destPath" /E /FFT /Z /R:2 /W:2 /NP /NFL /NDL
+                  if ($LASTEXITCODE -ge 8) { throw "Robocopy failed with exit code $LASTEXITCODE" }
+
+                  # --- 5. START ---
+                  Start-WebAppPool -Name $appPool
+                  Write-Host "Deployment to ${{ parameters.siteName }} completed."
+              }
+              catch {
+                  Write-Host "##vso[task.logissue type=error]DEPLOYMENT FAILED: $($_.Exception.Message)"
+                  if ($filesTouched -and $backupFile -and (Test-Path $backupFile)) {
+                      Write-Host "=== AUTOMATIC ROLLBACK: restoring $backupFile ==="
+                      Get-ChildItem $destPath -Force | Remove-Item -Recurse -Force
+                      [System.IO.Compression.ZipFile]::ExtractToDirectory($backupFile, $destPath)
+                  } elseif ($filesTouched) {
+                      Write-Host "##vso[task.logissue type=warning]No backup available. Manual intervention required."
+                  } else {
+                      Write-Host "Failure occurred before any file was changed."
+                  }
+                  Start-WebAppPool -Name $appPool
+                  throw "Deployment to ${{ parameters.siteName }} failed. See log above."
+              }
+              # robocopy leaves 1-7 in LASTEXITCODE on success; reset so the task passes
+              exit 0
+            displayName: 'Stop, Backup, Sync, Restart (auto-rollback on failure)'

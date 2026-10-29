@@ -1,0 +1,5 @@
+*.pfx
+*.pem
+*.key
+*.publishsettings
+.vs/

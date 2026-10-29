@@ -1,0 +1,76 @@
+# ==========================================================
+# STAGE TEMPLATE: Manual rollback to a chosen backup
+# Run the pipeline with performRollback = true.
+# ==========================================================
+parameters:
+  - name: siteName
+    type: string
+  - name: poolName
+    type: string
+  - name: productionPath
+    type: string
+  - name: appPoolName
+    type: string
+  - name: backupDir
+    type: string
+  - name: backupToRestore    # 'latest' or an exact file name
+    type: string
+    default: latest
+  - name: environmentName
+    type: string
+
+stages:
+- stage: Rollback_${{ parameters.siteName }}
+  displayName: 'Rollback ${{ parameters.siteName }}'
+  dependsOn: []
+  jobs:
+  - deployment: RollbackIIS
+    displayName: 'Restore backup and restart (${{ parameters.siteName }})'
+    environment: ${{ parameters.environmentName }}
+    pool:
+      name: ${{ parameters.poolName }}
+    workspace:
+      clean: all
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none
+          - checkout: none
+          - powershell: |
+              $ErrorActionPreference = "Stop"
+              $destPath  = "${{ parameters.productionPath }}"
+              $appPool   = "${{ parameters.appPoolName }}"
+              $backupDir = "${{ parameters.backupDir }}"
+              $requested = "${{ parameters.backupToRestore }}"
+
+              if (-not (Test-Path $backupDir)) { throw "Backup directory '$backupDir' not found." }
+
+              if ($requested -eq 'latest') {
+                  $f = Get-ChildItem $backupDir -Filter "PreDeploy_Backup_*.zip" |
+                       Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                  if ($null -eq $f) { throw "No backups found in '$backupDir'." }
+                  $backupPath = $f.FullName
+              } else {
+                  $backupPath = Join-Path $backupDir $requested
+                  if (-not (Test-Path $backupPath)) { throw "Backup '$requested' not found." }
+              }
+              Write-Host "=== ROLLBACK ${{ parameters.siteName }}: $backupPath -> $destPath ==="
+
+              Import-Module WebAdministration
+              if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") {
+                  Stop-WebAppPool -Name $appPool
+                  $timeout = 90; $elapsed = 0
+                  while ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped" -and $elapsed -lt $timeout) {
+                      Start-Sleep -Seconds 1; $elapsed++
+                  }
+                  if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") { throw "App Pool did not stop. Rollback aborted." }
+              }
+
+              Get-ChildItem $destPath -Force | Remove-Item -Recurse -Force
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              [System.IO.Compression.ZipFile]::ExtractToDirectory($backupPath, $destPath)
+
+              Start-WebAppPool -Name $appPool
+              Write-Host "=== ROLLBACK COMPLETE ==="
+            displayName: 'Restore selected backup'
